@@ -1,38 +1,114 @@
-name: Create Alfred Workflow
+name: Windows RDP via Tailscale
 
-on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
-  
+on: [push]
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  rdp-setup:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
     steps:
-    - uses: actions/checkout@v2
-    - name: Build Alfred Workflow
-      id: alfred_builder
-      uses: mperezi/build-alfred-workflow@v1
-      with:
-        workflow_dir: .
-        exclude_patterns: '.git/* .github/* .gitignore LICENSE'
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
+    - name: Download Tailscale
+      run: |
+        Write-Output "⬇️ Lade Tailscale herunter..."
+        Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile tailscale-setup.exe
+        Write-Output "✅ Tailscale downloaded"
+
+    - name: Install Tailscale
+      run: |
+        Write-Output "📦 Installiere Tailscale..."
+        & ".\tailscale-setup.exe" /quiet /norestart
+        Start-Sleep -Seconds 10
+        Write-Output "✅ Tailscale installiert"
+
+    - name: Authenticate Tailscale
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: ${{ github.ref }}
-        draft: false
-        prerelease: false
-    - name: Upload Alfred Workflow
-      uses: actions/upload-release-asset@v1
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        Write-Output "🔐 Authentifiziere Tailscale..."
+        $ErrorActionPreference = "Stop"
+        Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+        & "C:\Program Files\Tailscale\tailscale.exe" login --authkey=$env:TAILSCALE_AUTH_KEY --hostname="github-rdp-$(Get-Random -Minimum 1000 -Maximum 9999)"
+        Start-Sleep -Seconds 5
+        Write-Output "✅ Tailscale authentifiziert"
+
+    - name: Get Tailscale IP
+      id: tailscale-ip
+      run: |
+        $maxAttempts = 30
+        $attempt = 0
+        $tailscaleIp = $null
+        while ($attempt -lt $maxAttempts -and -not $tailscaleIp) {
+          try {
+            $tailscaleIp = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+            if ($tailscaleIp) { break }
+          } catch {
+            Write-Output "⏳ Warte auf Tailscale IP... (Versuch $($attempt + 1)/$maxAttempts)"
+          }
+          Start-Sleep -Seconds 2
+          $attempt += 1
+        }
+        if (-not $tailscaleIp) {
+          Write-Output "::error::Konnte Tailscale IP nicht ermitteln"
+          exit 1
+        }
+        "ip=$tailscaleIp" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+    - name: Enable RDP and Firewall
+      run: |
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+        New-NetFirewallRule -DisplayName "Allow RDP" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -ErrorAction SilentlyContinue
+
+    - name: Configure RDP for Stability
+      run: |
+        $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+        New-Item -Path $regPath -Force -ErrorAction SilentlyContinue | Out-Null
+        Set-ItemProperty -Path $regPath -Name "MaxConnectionTime" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $regPath -Name "MaxDisconnectionTime" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $regPath -Name "MaxIdleTime" -Value 0 -Force -ErrorAction SilentlyContinue
+
+    - name: Create Admin User
+      run: |
+        net user kamel007 "Kamel@123" /add /active:yes 2>$null
+        net localgroup administrators kamel007 /add 2>$null
+        wmic useraccount where name="kamel007" set PasswordExpires=False
+
+    - name: Display Connection Info
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ steps.alfred_builder.outputs.workflow_file }}
-        asset_name: ${{ steps.alfred_builder.outputs.workflow_file }}
-        asset_content_type: application/zip
+        TAILSCALE_IP: ${{ steps.tailscale-ip.outputs.ip }}
+      run: |
+        Write-Output "============================================"
+        Write-Output "||   ✅ TAILSCALE RDP READY             ||"
+        Write-Output "============================================"
+        Write-Output "🌐 Tailscale IP: $env:TAILSCALE_IP"
+        Write-Output "👤 Username: kamel007"
+        Write-Output "🔐 Password: Kamel@123"
+        Write-Output "============================================"
+
+    - name: Keep Windows Active
+      run: |
+        $keepAliveScript = @"
+        `$ErrorActionPreference = "SilentlyContinue"
+        `$startTime = Get-Date
+        `$maxDuration = [timespan]::FromMinutes(355)
+        while ((Get-Date) - `$startTime -lt `$maxDuration) {
+          try {
+            `$status = & "C:\Program Files\Tailscale\tailscale.exe" status
+            Write-Output "[`$(Get-Date -Format 'HH:mm:ss')] ✅ Tailscale aktiv"
+          } catch {
+            Restart-Service -Name "Tailscale" -Force
+          }
+          Start-Sleep -Seconds 60
+        }
+        "@
+        $keepAliveScript | Out-File "keep_alive.ps1"
+        Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File keep_alive.ps1" -WindowStyle Hidden
+        while ($true) { Start-Sleep -Seconds 300 }
+
+    - name: Graceful Tailscale Shutdown
+      if: always()
+      run: |
+        & "C:\Program Files\Tailscale\tailscale.exe" logout
+        Stop-Service -Name "Tailscale" -Force -ErrorAction SilentlyContinue                                           ---------tskey-auth-k1dsN5648721CNTRL-mNoR4zmYTvc56DJPryhpvc8sb8WG9WfGg
